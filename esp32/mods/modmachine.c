@@ -46,6 +46,18 @@
 #include "freertos/queue.h"
 #include "freertos/xtensa_api.h"
 
+#include <esp_types.h>
+#include "esp_err.h"
+#include "esp_intr.h"
+#include "esp_intr_alloc.h"
+#include "esp_attr.h"
+#include "esp_freertos_hooks.h"
+#include "soc/timer_group_struct.h"
+#include "soc/timer_group_reg.h"
+#include "esp_log.h"
+#include "driver/timer.h"
+
+
 /// \module machine - functions related to the SoC
 ///
 
@@ -130,6 +142,38 @@ STATIC mp_obj_t machine_enable_irq(uint n_args, const mp_obj_t *arg) {
 }
 MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(machine_enable_irq_obj, 0, 1, machine_enable_irq);
 
+static void task_wdt_isr(void *arg) {
+    // ack the interrupt
+    TIMERG0.int_clr_timers.wdt=1;
+    ets_printf("Task watchdog got triggered\n");
+}
+
+STATIC mp_obj_t machine_wdt_start(void) {
+    TIMERG0.wdt_wprotect=TIMG_WDT_WKEY_VALUE;
+    TIMERG0.wdt_config0.sys_reset_length=7;                 //3.2uS
+    TIMERG0.wdt_config0.cpu_reset_length=7;                 //3.2uS
+    TIMERG0.wdt_config0.level_int_en=1;
+    TIMERG0.wdt_config0.stg0=TIMG_WDT_STG_SEL_INT;          //1st stage timeout: interrupt
+    TIMERG0.wdt_config0.stg1=TIMG_WDT_STG_SEL_RESET_SYSTEM; //2nd stage timeout: reset system
+    TIMERG0.wdt_config1.clk_prescale=80*500;                //Prescaler: wdt counts in ticks of 0.5mS
+    TIMERG0.wdt_config2=10 * 2000;     //Set timeout before interrupt (10s)
+    TIMERG0.wdt_config3=10 * 2000;     //Set timeout before reset     (10s)
+    TIMERG0.wdt_config0.en=1;
+    TIMERG0.wdt_feed=1;
+    TIMERG0.wdt_wprotect=0;
+    esp_intr_alloc(ETS_TG0_WDT_LEVEL_INTR_SOURCE, 0, task_wdt_isr, NULL, NULL);
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_0(machine_wdt_start_obj, machine_wdt_start);
+
+STATIC mp_obj_t machine_wdt_feed(void) {
+    TIMERG0.wdt_wprotect=TIMG_WDT_WKEY_VALUE;
+    TIMERG0.wdt_feed=1;
+    TIMERG0.wdt_wprotect=0;
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_0(machine_wdt_feed_obj, machine_wdt_feed);
+
 STATIC const mp_rom_map_elem_t machine_module_globals_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR___name__),            MP_OBJ_NEW_QSTR(MP_QSTR_umachine) },
 
@@ -147,6 +191,8 @@ STATIC const mp_rom_map_elem_t machine_module_globals_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR_deepsleep),           (mp_obj_t)(&machine_deepsleep_obj) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_reset_cause),         (mp_obj_t)(&machine_reset_cause_obj) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_wake_reason),         (mp_obj_t)(&machine_wake_reason_obj) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_wdt_start),           (mp_obj_t)(&machine_wdt_start_obj) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_wdt_feed),            (mp_obj_t)(&machine_wdt_feed_obj) },
 
     { MP_OBJ_NEW_QSTR(MP_QSTR_disable_irq),         (mp_obj_t)&machine_disable_irq_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_enable_irq),          (mp_obj_t)&machine_enable_irq_obj },
