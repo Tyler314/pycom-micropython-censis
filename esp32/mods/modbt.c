@@ -312,9 +312,9 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT: {
         int32_t duration = bt_obj.scan_duration;
         // the unit of the duration is seconds
-        // printf("Start scanning\n");
+        // printf("Starting BT scan\n");
         if (duration < 0) {
-            duration = 0xFFFF;
+            duration = 0x0FFF;
         }
         esp_ble_gap_start_scanning(duration);
         break;
