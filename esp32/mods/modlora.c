@@ -624,7 +624,7 @@ static void TASK_LoRa (void *pvParameters) {
                         LoRaMacMibSetRequestConfirm(&mibReq);
 
                     #if defined(USE_BAND_868)
-                        LoRaMacTestSetDutyCycleOn(false);
+                        LoRaMacTestSetDutyCycleOn(true);
                     #endif
 
                         // change the frequency to be on the center of the band
