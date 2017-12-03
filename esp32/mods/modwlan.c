@@ -44,6 +44,7 @@
 #include "mpexception.h"
 #include "antenna.h"
 #include "modussl.h"
+#include "mpirq.h"
 
 #include "lwip/sockets.h"
 #include "lwip/dns.h"
@@ -56,6 +57,9 @@
 /******************************************************************************
  DEFINE TYPES
  ******************************************************************************/
+typedef union {
+    uint8_t mac[6];
+} wlan_event_result_t;
 
 /******************************************************************************
  DEFINE CONSTANTS
@@ -108,6 +112,10 @@
 
 #define FILE_READ_SIZE 256
 
+#define WIFI_MODE_PROMISCUOUS               (WIFI_MODE_MAX + 1)
+
+#define WLAN_EVENT_PRMS_PROBE               (1)
+
 /******************************************************************************
  DECLARE PRIVATE DATA
  ******************************************************************************/
@@ -130,7 +138,9 @@ wlan_obj_t wlan_obj = {
 //STATIC const mp_irq_methods_t wlan_irq_methods;
 
 static EventGroupHandle_t wifi_event_group;
+static QueueHandle_t xProbeQueue;
 
+#define WLAN_PROBE_QUEUE_SIZE_MAX                   16
 
 // Event bits
 const int CONNECTED_BIT = BIT0;
@@ -197,6 +207,7 @@ void wlan_pre_init (void) {
     wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_event_loop_init(wlan_event_handler, NULL));
     wlan_obj.base.type = (mp_obj_t)&mod_network_nic_type_wlan;
+    xProbeQueue = xQueueCreate(WLAN_PROBE_QUEUE_SIZE_MAX, sizeof(wlan_event_result_t));
 }
 
 void wlan_setup (int32_t mode, const char *ssid, uint32_t auth, const char *key, uint32_t channel, uint32_t antenna, bool add_mac) {
@@ -228,6 +239,67 @@ void wlan_setup (int32_t mode, const char *ssid, uint32_t auth, const char *key,
 
     // start the servers before returning
     wlan_servers_start();
+}
+
+typedef struct {
+    uint16_t protocol : 2;
+    uint16_t type : 2;
+    uint16_t subtype : 4;
+    uint16_t to_ds : 1;
+    uint16_t from_ds : 1;
+    uint16_t more_frag : 1;
+    uint16_t retry : 1;
+    uint16_t power_mgt : 1;
+    uint16_t more_data : 1;
+    uint16_t wep : 1;
+    uint16_t order : 1;
+} wlan_frame_control_t;
+
+typedef struct {
+    wlan_frame_control_t control;
+    uint8_t              duration[2];
+    uint8_t              address_1[6];
+    uint8_t              address_2[6];
+    uint8_t              address_3[6];
+    uint8_t              sequence_control[2];
+    uint8_t              address_4[6];
+} wlan_mac_header_t;
+
+// // this function will be called by the interrupt thread
+// STATIC void wlan_callback_handler (void *arg) {
+//     if (wlan_obj.handler != mp_const_none) {
+//         // printf("Handler=%d\n", (int32_t)wlan_obj.handler);
+//         mp_call_function_1(wlan_obj.handler, mp_obj_new_bytes(arg, 6));
+//     }
+//     vPortFree(arg);
+// }
+
+void wlan_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    // uint32_t len;
+    // uint32_t protocol = 0xFF, _type = 0xFF, subtype = 0xFF;
+    // len = ((wifi_promiscuous_pkt_t *)buf)->rx_ctrl.sig_len;
+    wlan_mac_header_t *header = (void *)(((wifi_promiscuous_pkt_t *)buf)->payload);
+    // protocol = header->control.protocol;
+    uint32_t _type = header->control.type;
+    uint32_t subtype = header->control.subtype;
+    // printf("wifi prx type=%d,len=%d,pro=%d,type=%d,subtype=%d\n",
+    //        (int)type, len, protocol, _type, subtype);
+    // We are interested in address_2!!
+    // if (wlan_obj.trigger == WLAN_EVENT_PRMS_PROBE) {
+        if (type == WIFI_PKT_MGMT && _type == 0 && subtype == 4) {
+            // printf("addr1 %x %x %x %x %x %x\n", header->address_1[0], header->address_1[1], header->address_1[2],
+            //                               header->address_1[3], header->address_1[4], header->address_1[5]);
+            // printf("addr2 %x %x %x %x %x %x\n", header->address_2[0], header->address_2[1], header->address_2[2],
+            //                               header->address_2[3], header->address_2[4], header->address_2[5]);
+            // printf("addr3 %x %x %x %x %x %x\n", header->address_3[0], header->address_3[1], header->address_3[2],
+            //                               header->address_3[3], header->address_3[4], header->address_3[5]);
+            // printf("addr4 %x %x %x %x %x %x\n", header->address_4[0], header->address_4[1], header->address_4[2],
+            //                               header->address_4[3], header->address_4[4], header->address_4[5]);
+            wlan_event_result_t wlan_event_result;
+            memcpy(&wlan_event_result.mac, header->address_2, sizeof(wlan_event_result.mac));
+            xQueueSend(xProbeQueue, (void *)&wlan_event_result, (TickType_t)0);
+        }
+    // }
 }
 
 void wlan_get_mac (uint8_t *macAddress) {
@@ -619,51 +691,71 @@ os_error:
 STATIC mp_obj_t wlan_init_helper(wlan_obj_t *self, const mp_arg_val_t *args) {
     // get the mode
     int8_t mode = args[0].u_int;
-    wlan_validate_mode(mode);
 
-    // get the ssid
-    const char *ssid = NULL;
-    if (args[1].u_obj != NULL) {
-        ssid = mp_obj_str_get_str(args[1].u_obj);
-        wlan_validate_ssid_len(strlen(ssid));
-    }
-
-    // get the auth config
-    uint8_t auth = WIFI_AUTH_OPEN;
-    const char *key = NULL;
-    if (args[2].u_obj != mp_const_none) {
-        mp_obj_t *sec;
-        mp_obj_get_array_fixed_n(args[2].u_obj, 2, &sec);
-        auth = mp_obj_get_int(sec[0]);
-        key = mp_obj_str_get_str(sec[1]);
-        if (strlen(key) < 8 || strlen(key) > 32) {
-            nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "invalid key length"));
+    if (mode == WIFI_MODE_PROMISCUOUS) {
+        // get the antenna type
+        uint8_t antenna = args[4].u_int;
+        if (micropy_hw_antenna_diversity) {
+            wlan_validate_antenna(antenna);
         }
-        wlan_validate_security(auth, key);
-    }
+        wlan_set_mode(WIFI_MODE_STA);
+        wlan_set_antenna(antenna);
+        esp_wifi_set_promiscuous_rx_cb(wlan_promiscuous_cb);
+        wifi_promiscuous_filter_t filter = {.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT};
+        esp_wifi_set_promiscuous_filter(&filter);
+        esp_wifi_set_promiscuous(true);
+        // get the channel
+        uint8_t channel = args[3].u_int;
+        wlan_validate_channel(channel);
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    } else {
 
-    // get the channel
-    uint8_t channel = args[3].u_int;
-    wlan_validate_channel(channel);
+        wlan_validate_mode(mode);
 
-    // get the antenna type
-    uint8_t antenna = args[4].u_int;
-    wlan_validate_antenna(antenna);
-
-    wlan_obj.pwrsave = args[5].u_bool;
-
-    if (mode != WIFI_MODE_STA) {
-        if (ssid == NULL) {
-            nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "AP SSID not given"));
+        // get the ssid
+        const char *ssid = NULL;
+        if (args[1].u_obj != NULL) {
+            ssid = mp_obj_str_get_str(args[1].u_obj);
+            wlan_validate_ssid_len(strlen(ssid));
         }
-        if (auth == WIFI_AUTH_WPA2_ENTERPRISE) {
-            nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "WPA2_ENT not supported in AP mode"));
-        }
-    }
 
-    // initialize the wlan subsystem
-    wlan_setup(mode, (const char *)ssid, auth, (const char *)key, channel, antenna, false);
-    mod_network_register_nic(&wlan_obj);
+        // get the auth config
+        uint8_t auth = WIFI_AUTH_OPEN;
+        const char *key = NULL;
+        if (args[2].u_obj != mp_const_none) {
+            mp_obj_t *sec;
+            mp_obj_get_array_fixed_n(args[2].u_obj, 2, &sec);
+            auth = mp_obj_get_int(sec[0]);
+            key = mp_obj_str_get_str(sec[1]);
+            if (strlen(key) < 8 || strlen(key) > 32) {
+                nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "invalid key length"));
+            }
+            wlan_validate_security(auth, key);
+        }
+
+        // get the channel
+        uint8_t channel = args[3].u_int;
+        wlan_validate_channel(channel);
+
+        // get the antenna type
+        uint8_t antenna = args[4].u_int;
+        wlan_validate_antenna(antenna);
+
+        wlan_obj.pwrsave = args[5].u_bool;
+
+        if (mode != WIFI_MODE_STA) {
+            if (ssid == NULL) {
+                nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "AP SSID not given"));
+            }
+            if (auth == WIFI_AUTH_WPA2_ENTERPRISE) {
+                nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "WPA2_ENT not supported in AP mode"));
+            }
+        }
+
+        // initialize the wlan subsystem
+        wlan_setup(mode, (const char *)ssid, auth, (const char *)key, channel, antenna, false);
+        mod_network_register_nic(&wlan_obj);
+    }
 
     return mp_const_none;
 }
@@ -1096,35 +1188,45 @@ STATIC mp_obj_t wlan_mac (mp_uint_t n_args, const mp_obj_t *args) {
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(wlan_mac_obj, 1, 2, wlan_mac);
 
-//STATIC mp_obj_t wlan_irq (mp_uint_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-//    mp_arg_val_t args[mp_irq_INIT_NUM_ARGS];
-//    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, mp_irq_INIT_NUM_ARGS, mp_irq_init_args, args);
-//
-//    wlan_obj_t *self = pos_args[0];
-//
-//    // check the trigger, only one type is supported
-//    if (mp_obj_get_int(args[0].u_obj) != MODWLAN_WIFI_EVENT_ANY) {
-//        goto invalid_args;
-//    }
-//
-//    // check the power mode
-//    if (mp_obj_get_int(args[3].u_obj) != PYB_PWR_MODE_LPDS) {
-//        goto invalid_args;
-//    }
-//
-//    // create the callback
-//    mp_obj_t _irq = mp_irq_new (self, args[2].u_obj, &wlan_irq_methods);
-//    self->irq_obj = _irq;
-//
-//    // enable the irq just before leaving
-//    wlan_lpds_irq_enable(self);
-//
-//    return _irq;
-//
-//invalid_args:
-//    nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, mpexception_value_invalid_arguments));
-//}
-//STATIC MP_DEFINE_CONST_FUN_OBJ_KW(wlan_irq_obj, 1, wlan_irq);
+// \method callback(trigger, handler, arg)
+STATIC mp_obj_t wlan_callback(mp_uint_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    STATIC const mp_arg_t allowed_args[] = {
+        { MP_QSTR_trigger,      MP_ARG_REQUIRED | MP_ARG_OBJ,   },
+        { MP_QSTR_handler,      MP_ARG_OBJ,                     {.u_obj = mp_const_none} },
+        { MP_QSTR_arg,          MP_ARG_OBJ,                     {.u_obj = mp_const_none} },
+    };
+
+    // parse arguments
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(args), allowed_args, args);
+    wlan_obj_t *self = pos_args[0];
+
+    // enable the callback
+    if (args[0].u_obj != mp_const_none && args[1].u_obj != mp_const_none) {
+        self->trigger = mp_obj_get_int(args[0].u_obj);
+        self->handler = args[1].u_obj;
+        if (args[2].u_obj == mp_const_none) {
+            self->handler_arg = self;
+        } else {
+            self->handler_arg = args[2].u_obj;
+        }
+    } else {
+        self->trigger = 0;
+    }
+
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_KW(wlan_callback_obj, 1, wlan_callback);
+
+STATIC mp_obj_t wlan_get_probe_mac(mp_obj_t self_in) {
+    wlan_event_result_t wlan_event;
+
+    if (xQueueReceive(xProbeQueue, &wlan_event, (TickType_t)0)) {
+        return mp_obj_new_bytes(wlan_event.mac, sizeof(wlan_event.mac));
+    }
+    return mp_const_none;
+ }
+ STATIC MP_DEFINE_CONST_FUN_OBJ_1(wlan_get_probe_mac_obj, wlan_get_probe_mac);
 
 STATIC const mp_map_elem_t wlan_locals_dict_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR_init),                (mp_obj_t)&wlan_init_obj },
@@ -1141,7 +1243,8 @@ STATIC const mp_map_elem_t wlan_locals_dict_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR_channel),             (mp_obj_t)&wlan_channel_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_antenna),             (mp_obj_t)&wlan_antenna_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_mac),                 (mp_obj_t)&wlan_mac_obj },
-//    { MP_OBJ_NEW_QSTR(MP_QSTR_irq),                 (mp_obj_t)&wlan_irq_obj },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_probe_mac),           (mp_obj_t)&wlan_get_probe_mac_obj },
+    // { MP_OBJ_NEW_QSTR(MP_QSTR_callback),            (mp_obj_t)&wlan_callback_obj },
     // { MP_OBJ_NEW_QSTR(MP_QSTR_connections),         (mp_obj_t)&wlan_connections_obj },
     // { MP_OBJ_NEW_QSTR(MP_QSTR_urn),                 (mp_obj_t)&wlan_urn_obj },
 
@@ -1149,6 +1252,7 @@ STATIC const mp_map_elem_t wlan_locals_dict_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR_STA),                 MP_OBJ_NEW_SMALL_INT(WIFI_MODE_STA) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_AP),                  MP_OBJ_NEW_SMALL_INT(WIFI_MODE_AP) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_STA_AP),              MP_OBJ_NEW_SMALL_INT(WIFI_MODE_APSTA) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_PROMISCUOUS),         MP_OBJ_NEW_SMALL_INT(WIFI_MODE_PROMISCUOUS) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_WEP),                 MP_OBJ_NEW_SMALL_INT(WIFI_AUTH_WEP) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_WPA),                 MP_OBJ_NEW_SMALL_INT(WIFI_AUTH_WPA_PSK) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_WPA2),                MP_OBJ_NEW_SMALL_INT(WIFI_AUTH_WPA2_PSK) },
@@ -1156,6 +1260,8 @@ STATIC const mp_map_elem_t wlan_locals_dict_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR_INT_ANT),             MP_OBJ_NEW_SMALL_INT(ANTENNA_TYPE_INTERNAL) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_EXT_ANT),             MP_OBJ_NEW_SMALL_INT(ANTENNA_TYPE_EXTERNAL) },
 //    { MP_OBJ_NEW_QSTR(MP_QSTR_ANY_EVENT),           MP_OBJ_NEW_SMALL_INT(MODWLAN_WIFI_EVENT_ANY) },
+
+    { MP_OBJ_NEW_QSTR(MP_QSTR_EVENT_PRMS_PROBE),    MP_OBJ_NEW_SMALL_INT(WLAN_EVENT_PRMS_PROBE) },
 };
 STATIC MP_DEFINE_CONST_DICT(wlan_locals_dict, wlan_locals_dict_table);
 

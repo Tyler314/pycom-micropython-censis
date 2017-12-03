@@ -44,6 +44,10 @@ typedef struct _wlan_obj_t {
 
     uint32_t                ip;
 
+    mp_obj_t                handler;
+    mp_obj_t                handler_arg;
+    uint32_t                trigger;
+
     int8_t                  mode;
     uint8_t                 auth;
     uint8_t                 channel;

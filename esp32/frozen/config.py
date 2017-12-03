@@ -1,0 +1,19 @@
+from network import WLAN
+
+# CENSIS Gateway
+LORA_APP_EUI = '632455d660417467'
+LORA_APP_KEY = 'dd38c49242a2f51cd83ee16842aacbb9'
+
+# Pycom Gateway
+# LORA_APP_EUI = 'AD A4 DA E3 AC 12 67 6B'.replace(' ','')
+# LORA_APP_KEY = '11 B0 28 2A 18 9B 75 B0 B4 D2 D8 C7 FA 38 54 8B'.replace(' ','')
+
+# Behaviour
+BLUETOOTH_DEVICE_TIMEOUT_SEC = 60
+WIFI_DEVICE_TIMEOUT_SEC = 60
+LORA_JOIN_TIMEOUT_SEC = 300 # 5 minutes
+LORA_REJOIN_PERIOD_S = 7200 # 2 hours
+WIFI_SCAN_CHANNEL = 3
+WIFI_ANTENNA = WLAN.EXT_ANT # Use the external (EXT_ANT) or the internal (INT_ANT) wifi antenna
+NBR_MACS_PER_LORA_PACKET = 3
+LORA_DR = 5 # SF7BW125
